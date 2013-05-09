@@ -24,10 +24,9 @@ import "Accessibility"
         @screensThatNeedReflowing = []
         @spacesThatNeedReflowing  = []
 
+        self syncWithCurrentOsReportedState
+
         workspace = NSWorkspace sharedWorkspace
-        workspace runningApplications each: { app |
-             self addApplicationWithPID: app processIdentifier unless app bundleIdentifier hasPrefix: "com.apple.dashboard"
-        }
 
         workspace notificationCenter
                 observe: NSWorkspaceDidLaunchApplicationNotification with: { n |
@@ -48,9 +47,8 @@ import "Accessibility"
                                                 reflow
                 };
                 observe: NSWorkspaceActiveSpaceDidChangeNotification with: { n |
-                    ~self markAllScreensForReflowing;
-                               markSpaceForReflowing: self currentSpaceId;
-                                              reflow
+                    ~self syncWithCurrentOsReportedState;
+                          reflow
                 }
         ^self
     }
@@ -97,53 +95,101 @@ import "Accessibility"
 \        CGSAddWindowsToSpaces(conn, [window _cgWindow], [destSpace]) print
 \    }
 
+     \ Update our data structures and what's shown on screen to reflect the latest state reported
+     \ by the OS. In particular:
+     \ 1. Find and track any new applications and windows
+     \ 2. Activate/deactivate windows to reflect the OS's report of what should
+     \    be shown/hidden on the current space
+     \ Notes:
+     \ * We don't detected deleted windows/applications here
+     \ * We attempt to maintain the stack order as we show hide/windows
+     \ ** But we can improperly order any window that's on multiple spaces, which
+     \    is possible -- e.g. if a window is assigned to "All Desktops"
+     \    (See http://support.apple.com/kb/PH4313?viewlocale=en_US)
+     \    Such windows will get forced to the front of the stack order during space switching.
+     \    To fix this we probably need to have a separate window list
+     \    for each space, rather than just @activeWindows/@inactiveWindows; then we'll know
+     \    the position those windows are supposed to have for each particular space.
+     - syncWithCurrentOsReportedState
+      {
+          self findNewApplications
+
+          targetWindows = self getWindowsThatShouldBeActive: @applications
+
+          windowsToActivate = []
+          windowsToDeactivate = []
+
+          @activeWindows each: { window |
+              if targetWindows containsObject: window {
+                  targetWindows remove: window
+              }
+              else {
+                  windowsToDeactivate push: window
+              }
+          }
+          @inactiveWindows each: { window |
+              if targetWindows containsObject: window {
+                  windowsToActivate push: window
+                  targetWindows remove: window
+              }
+          }
+
+          windowsToActivate each: { window |
+               self activateWindow: window
+          }
+          windowsToDeactivate each: { window |
+               self deactivateWindow: window
+          }
+
+          newlyDiscoveredWindows = targetWindows
+          newlyDiscoveredWindows each: { window |
+              self addWindow: window
+          }
+      }
+
+     - findNewApplications
+     {
+          workspace = NSWorkspace sharedWorkspace
+
+          workspace runningApplications each: { app |
+              ^nil if app bundleIdentifier hasPrefix: "com.apple.dashboard"
+              pid = app processIdentifier
+              accessibilityApp = AccessibilityElement withPID: pid
+              ^nil unless accessibilityApp isKindOfClass: AccessibilityApplication
+              unless @applications containsObject: accessibilityApp {
+                  \ Watch for new window notifications
+                  accessibilityApp observe: #AXWindowCreated on: accessibilityApp with: { newWindow |
+                    ~self addWindow: newWindow; reflow
+                  }
+                  @applications push: accessibilityApp
+              }
+         }
+     }
+
+    - getWindowsThatShouldBeActive: applications
+    {
+          activeWindows  = []
+
+          applications each: { app |
+              ^nil unless app isKindOfClass: AccessibilityApplication
+              app[#AXWindows] each: { window |
+                  ^nil unless window isKindOfClass: AccessibilityWindow
+                  ^nil unless window isResizable
+                  ^nil unless @windowChecker == nil or @windowChecker(window)
+    
+                  \ this check doesn't seem necessary, but it won't hurt
+                  ^nil unless window spaceIds containsObject: self currentSpaceId
+    
+                  activeWindows push: window
+              }
+          }
+
+          ^activeWindows
+    }
+
     - applicationWithPID: pid
     {
         ^@applications find: `app| (app pid) == pid`
-    }
-    - addApplicationWithPID: pid
-    {
-        ^nil if self applicationWithPID: pid
-        app = AccessibilityElement withPID: pid
-        ^nil unless app isKindOfClass: AccessibilityApplication
-        @applications push: app
-
-        app[#AXWindows] each: { window |
-            self addWindow: window active: (0 == app[#AXHidden])
-        }
-
-        \ Watch for new window notifications
-        app observe: #AXWindowCreated on: app with: { newWindow |
-            ~self addWindow: newWindow; reflow
-        }
-    }
-
-    - addWindow: window `self addWindow: window active: yes`
-    - addWindow: window active: isActive
-    {
-        ^nil unless window isKindOfClass: AccessibilityWindow
-        ^nil unless window isResizable
-        ^nil unless @windowChecker == nil or @windowChecker(window)
-
-        self markScreenForReflowing: window screen
-        self markSpacesForReflowing: window spaceIds
-
-        if isActive && window[#AXMinimized] boolValue ~= 1 then
-            @activeWindows insert: window at: 0
-        else
-            @inactiveWindows push: window
-
-        app = self applicationWithPID: window pid
-        app observe: #AXUIElementDestroyed on: window with: { w |
-            ~self removeWindow: window; reflow
-        }
-        app observe: #AXWindowMiniaturized on: window with: { w |
-            ~self deactivateWindow: window; reflow
-        }
-        app observe: #AXWindowDeminiaturized on: window with: { w |
-            ~self activateWindow: window; reflow
-        }
-        ^valid
     }
 
     - managedWindowsForScreen: screen space: spaceId
@@ -168,6 +214,24 @@ import "Accessibility"
         self markSpacesForReflowing: window spaceIds
         @activeWindows remove: window
         @inactiveWindows push: window
+    }
+    - addWindow: window
+    {
+        self markScreenForReflowing: window screen
+        self markSpacesForReflowing: window spaceIds
+
+        @activeWindows insert: window at: 0
+
+        app = self applicationWithPID: window pid
+        app observe: #AXUIElementDestroyed on: window with: { w |
+            ~self removeWindow: window; reflow
+        }
+        app observe: #AXWindowMiniaturized on: window with: { w |
+            ~self deactivateWindow: window; reflow
+        }
+        app observe: #AXWindowDeminiaturized on: window with: { w |
+            ~self activateWindow: window; reflow
+        }
     }
     - removeWindow: window
     {
